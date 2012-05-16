@@ -9,21 +9,30 @@ date_default_timezone_set('America/New_York');
 class CurrencyConverter {
     /**
      * According to Wikipedia, there are 182 currencies in circulation throughout the world.
-     * We'll store the exchange rates in memory, rather than looking up each exchange
-     * rate upon conversion. The currency symbol becomes the array key e.g.,
+     * We could store the exchange rates in memory, rather than looking up each exchange
+     * rate upon conversion from disk. The currency symbol becomes the array key e.g.,
      *
      *     $exchangeRate['CHF'] = 1.1154
      * 
      * http://en.wikipedia.org/wiki/List_of_circulating_currencies
+     * 
+     * One other consideration is how often to pull data from the remote web service.
+     * One approach is to store the timestamp of the last refresh as a private property.
+     * This functionality is omitted in this sample code.
      */
-    
     private $webServiceURI = 'http://toolserver.org/~kaldari/rates.xml';
     private $defaultCurrency = 'USD';
     private $exchangeRates = array();
+    private $mysqli = NULL;
     
     public function __construct($uri = NULL) {
         if (isset($uri) && !empty($uri)) {
             $this->webServiceURI = $uri;
+        }
+
+        // Ideally we'd use PDO or a database abstraction layer
+        if ($this->mysqli === NULL) {
+            $this->mysqli = new mysqli('localhost', 'username', 'password', 'CurrencyConverter');
         }
         
         $this->getExchangeRates();
@@ -31,17 +40,25 @@ class CurrencyConverter {
     
     /**
      * Fetches the current list of exchange rates from the remote server.
-     * The rates are saved in an associative array for quick retrieval.
+     * The rates are saved in MySQL.
      */
     private function getExchangeRates() {
-        /**
-         * We could use curl to access the XML feed.
-         */
-        $exchangeRateXML = simplexml_load_file($this->webServiceURI);
+        $values = array();
+
+        // NOTE: We could use curl for more robust handling of remote connections
         
+        // TODO: Improve error handling when calling the RESTful web service
+        $exchangeRateXML = simplexml_load_file($this->webServiceURI);
+
+        /**
+         * Using multi-insert in one query execution instead of executing
+         * mulltiple prepared statements for lower server overhead.
+         */
         foreach ($exchangeRateXML->conversion as $conversion) {
-            $this->exchangeRates[(string)$conversion->currency] = (float)$conversion->rate;
+            $values[] = '("' . (string)$conversion->currency . '", ' . (float)$conversion->rate . ')';
         }
+
+        $this->mysqli->query('INSERT INTO exchange_rates (currency, rate) VALUES ' . implode(',', $values));
     }
     
     /**
@@ -68,15 +85,24 @@ class CurrencyConverter {
      */
     private function convertCurrencyByArray($transactions) {
         $convertedCurrency = array();
-                    
+
+        // We'll use prepared statements because we have [2, 212] potential requests
+
+        $stmt = $this->mysqli->prepare("SELECT currency, rate FROM exchange_rates WHERE currency = ?");
+        
         foreach ($transactions as $transaction) {
             list($currency, $amount) = explode(" ", $transaction);
+            $stmt->bind_param("s", $currency);
+            $stmt->execute();
+            $res = $stmt->get_result();
+            $row = $res->fetch_assoc();
             
-            $convertedCurrency[] = $this->computeExchangeRate($currency, $amount);
+            $convertedCurrency[] = $this->defaultCurrency . ' ' . number_format((float)$row['rate'] * (float)$amount, 2);
         }
+
+        $stmt->close();
         
         return $convertedCurrency;
-
     }
     
     /**
@@ -87,26 +113,23 @@ class CurrencyConverter {
      */
     private function convertCurrencyByAmount($transaction) {
         list($currency, $amount) = explode(" ", $transaction);
-       
-        return $this->computeExchangeRate($currency, $amount);
+
+        $stmt = $this->mysqli->prepare("SELECT currency, rate FROM exchange_rates WHERE currency = ?");
+        $stmt->bind_param("s", $currency);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res->fetch_assoc();
+        
+        $stmt->close();
+
+        return $this->defaultCurrency . ' ' . number_format((float)$row['rate'] * (float)$amount, 2);
     }
-    
-    /**
-     * Formats the currency and amount into the default currency
-     * 
-     * @param string $currency The currency symbol
-     * @param float $amount The amount for this transaction
-     * @return string A formated string in the default currency e.g., USD 987.65
-     */
-    private function computeExchangeRate($currency, $amount) {
-        if (array_key_exists((string)$currency, $this->exchangeRates)) {
-            return $this->defaultCurrency . ' ' . number_format($this->exchangeRates[$currency] * (float)$amount, 2);
-        } else {
-            // TODO: Handle unrecognized currency symbol 
-        }
+
+    public function __destruct() {
+        $this->mysqli->close();
     }
 }
 
 $cc = new CurrencyConverter();
-echo $cc->convertCurrency('AUD 562.5') . PHP_EOL;
+echo $cc->convertCurrency('AUD 562.5') . "\n";
 print_r($cc->convertCurrency(array('JPY 5000', 'CZK 62.5')));
